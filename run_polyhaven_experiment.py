@@ -407,15 +407,12 @@ def forward_rendering(args):
                     decode_chunk_size=cfg.get("decode_chunk_size", None),
                 ).frames[0]
 
-            # Save only the actual (non-padded) frames
+            # Save only the actual (non-padded) frames that have ground truth
+            n_save = min(len(original_frame_ids), len(inference_image_list))
             os.makedirs(scene_output_dir, exist_ok=True)
             viz_frames = []
-            saved_fids = set()
-            for idx in range(min(n_actual_frames, len(inference_image_list))):
+            for idx in range(n_save):
                 fid = original_frame_ids[idx]
-                if fid in saved_fids:
-                    continue
-                saved_fids.add(fid)
                 pil_img = inference_image_list[idx]
                 save_path = os.path.join(scene_output_dir, f"{fid}.png")
                 pil_img.save(save_path)
@@ -431,7 +428,7 @@ def forward_rendering(args):
                 )
 
             touch(os.path.join(scene_output_dir, "done.txt"))
-            print(f"[OK] {scene_name}: {n_actual_frames} frames rendered (padded to {n_frames})")
+            print(f"[OK] {scene_name}: {n_save} frames rendered")
 
 
 # ─────────────────────── Step 3: evaluate ──────────────────────────
