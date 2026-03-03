@@ -93,9 +93,66 @@ def prepare(args):
 # ─────────────────────── Step 2: forward rendering ─────────────────────
 
 
+def recover_hdr_from_pngs(ldr_png, hdr_png):
+    """
+    Recover original HDR from preprocessing outputs.
+
+    preprocess_objaverse.py saved:
+      _ldr.png = clip(hdr, 0, 1) ^ (1/2.2)
+      _hdr.png = log1p(10 * hdr) / max(log1p(10 * hdr))
+
+    We reverse-engineer the unknown per-image max M using LDR pixels
+    where hdr <= 1, then recover the full HDR including highlights.
+
+    Args:
+        ldr_png: float32 array [H, W, 3] in [0, 1] from _ldr.png
+        hdr_png: float32 array [H, W, 3] in [0, 1] from _hdr.png
+
+    Returns:
+        hdr_recovered: float32 array [H, W, 3], linear HDR values
+    """
+    hdr_clipped = np.power(np.clip(ldr_png, 1e-6, 1.0), 2.2)
+
+    # Estimate M = max(log1p(10 * hdr)) using mid-range pixels
+    # where both images have reliable values (avoid near-zero and saturated)
+    mask = (hdr_clipped > 0.02) & (hdr_clipped < 0.9) & (hdr_png > 0.02)
+
+    if mask.any():
+        log_vals = np.log1p(10.0 * hdr_clipped[mask])
+        M_estimates = log_vals / hdr_png[mask]
+        M = float(np.median(M_estimates))
+    else:
+        M = float(np.log1p(10.0))
+
+    M = max(M, 1.0)
+
+    hdr_recovered = np.expm1(hdr_png * M) / 10.0
+    hdr_recovered = np.clip(hdr_recovered, 0.0, 65504.0)
+    return hdr_recovered
+
+
+def apply_model_hdr_mapping(hdr_np, device):
+    """
+    Apply the model's expected tone mapping (from utils/utils_env_proj.py hdr_mapping).
+
+    Returns env_ldr and env_log as float32 tensors [H, W, 3] in [0, 1].
+    """
+    import src.data.rendering_utils as util
+
+    hdr_t = torch.from_numpy(hdr_np).float().to(device)
+    env_ldr = util.rgb2srgb(util.reinhard(hdr_t, max_point=16).clamp(0, 1))
+    env_log = util.rgb2srgb(
+        (torch.log1p(hdr_t) / np.log1p(10000)).clamp(0, 1)
+    )
+    return env_ldr.cpu(), env_log.cpu()
+
+
 def load_per_frame_envmaps(envmap_dir, frame_ids, target_h, target_w, device):
     """
-    Load per-frame _ldr.png and _hdr.png from envmap_dir.
+    Load per-frame _ldr.png and _hdr.png, recover original HDR,
+    then apply the model's tone mapping (reinhard+sRGB for LDR,
+    log1p/log1p(10000)+sRGB for log).
+
     Returns env_ldr and env_log tensors of shape (1, F, C, H, W) in [0, 1].
     """
     env_ldr_list = []
@@ -117,12 +174,14 @@ def load_per_frame_envmaps(envmap_dir, frame_ids, target_h, target_w, device):
         if hdr_img.size != (target_w, target_h):
             hdr_img = hdr_img.resize((target_w, target_h), Image.BILINEAR)
 
-        env_ldr_list.append(
-            torch.from_numpy(np.asarray(ldr_img).astype(np.float32) / 255.0)
-        )
-        env_log_list.append(
-            torch.from_numpy(np.asarray(hdr_img).astype(np.float32) / 255.0)
-        )
+        ldr_np = np.asarray(ldr_img).astype(np.float32) / 255.0
+        hdr_np = np.asarray(hdr_img).astype(np.float32) / 255.0
+
+        hdr_recovered = recover_hdr_from_pngs(ldr_np, hdr_np)
+        env_ldr, env_log = apply_model_hdr_mapping(hdr_recovered, device)
+
+        env_ldr_list.append(env_ldr)
+        env_log_list.append(env_log)
 
     env_ldr = torch.stack(env_ldr_list, dim=0)  # (F, H, W, 3)
     env_log = torch.stack(env_log_list, dim=0)
