@@ -281,14 +281,15 @@ def forward_rendering(args):
                 print(f"[WARN] {scene_name}: no G-buffer frames found, skipping")
                 continue
 
-            n_frames = min(len(frame_keys), inference_n_frames)
+            n_actual_frames = len(frame_keys)
+            n_frames = inference_n_frames
 
-            # Load G-buffers
+            # Load G-buffers, padding to inference_n_frames by repeating last frame
             cond_images = {}
             width, height = None, None
             for gbuf_label in cond_gbuf_labels:
                 gbuf_list = []
-                for i in range(n_frames):
+                for i in range(min(n_actual_frames, n_frames)):
                     chunk_id, frame_id = frame_keys[i]
                     gbuf_path = os.path.join(
                         scene_delighting, f"{chunk_id}.{frame_id}.{gbuf_label}.png"
@@ -309,13 +310,16 @@ def forward_rendering(args):
                             img = img.resize((width, height), Image.BILINEAR)
                     gbuf_list.append(np.asarray(img))
 
-                if len(gbuf_list) < n_frames:
+                if not gbuf_list:
                     break
+
+                # Pad by repeating last frame
+                while len(gbuf_list) < n_frames:
+                    gbuf_list.append(gbuf_list[-1])
 
                 gbuf_array = (
                     np.stack(gbuf_list, axis=0)[None, ...].astype(np.float32) / 255.0
                 )
-                # Repeat if use_fixed_frame_ind
                 if cfg.get("use_fixed_frame_ind", False):
                     fi = cfg.get("fixed_frame_ind", 0)
                     gbuf_array = np.concatenate(
@@ -342,16 +346,12 @@ def forward_rendering(args):
                 if f.endswith(".png")
             ])
 
-            if len(original_frame_ids) < n_frames:
-                print(
-                    f"[WARN] {scene_name}: only {len(original_frame_ids)} input frames "
-                    f"but need {n_frames}, skipping"
-                )
-                continue
-
+            # Use actual frame IDs; pad to inference_n_frames by repeating last
             env_frame_ids = original_frame_ids[:n_frames]
+            while len(env_frame_ids) < n_frames:
+                env_frame_ids.append(env_frame_ids[-1])
 
-            # Load per-frame env maps
+            # Load per-frame env maps (already padded)
             try:
                 env_ldr, env_log = load_per_frame_envmaps(
                     os.path.join(data_dir, scene_name, "envmaps"),
@@ -407,12 +407,16 @@ def forward_rendering(args):
                     decode_chunk_size=cfg.get("decode_chunk_size", None),
                 ).frames[0]
 
-            # Save outputs
+            # Save only the actual (non-padded) frames
             os.makedirs(scene_output_dir, exist_ok=True)
             viz_frames = []
-            for idx, (fid, pil_img) in enumerate(
-                zip(env_frame_ids, inference_image_list)
-            ):
+            saved_fids = set()
+            for idx in range(min(n_actual_frames, len(inference_image_list))):
+                fid = original_frame_ids[idx]
+                if fid in saved_fids:
+                    continue
+                saved_fids.add(fid)
+                pil_img = inference_image_list[idx]
                 save_path = os.path.join(scene_output_dir, f"{fid}.png")
                 pil_img.save(save_path)
                 viz_frames.append(np.asarray(pil_img))
@@ -427,7 +431,7 @@ def forward_rendering(args):
                 )
 
             touch(os.path.join(scene_output_dir, "done.txt"))
-            print(f"[OK] {scene_name}: {n_frames} frames rendered")
+            print(f"[OK] {scene_name}: {n_actual_frames} frames rendered (padded to {n_frames})")
 
 
 # ─────────────────────── Step 3: evaluate ──────────────────────────
