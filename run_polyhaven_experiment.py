@@ -467,15 +467,24 @@ def forward_rendering(args):
                 ).frames[0]
 
             # Save only the actual (non-padded) frames that have ground truth
+            # Composite onto white background using GT alpha for fair comparison
+            target_dir = os.path.join(data_dir, scene_name, "target_images")
             n_save = min(len(original_frame_ids), len(inference_image_list))
             os.makedirs(scene_output_dir, exist_ok=True)
             viz_frames = []
             for idx in range(n_save):
                 fid = original_frame_ids[idx]
                 pil_img = inference_image_list[idx]
+                pred_arr = np.asarray(pil_img.convert("RGB"))
+                gt_path = os.path.join(target_dir, f"{fid}.png")
+                if os.path.exists(gt_path):
+                    gt_pil = Image.open(gt_path)
+                    if gt_pil.mode == "RGBA":
+                        alpha = np.asarray(gt_pil)[:, :, 3]
+                        pred_arr = composite_on_white(pred_arr, alpha)
                 save_path = os.path.join(scene_output_dir, f"{fid}.png")
-                pil_img.save(save_path)
-                viz_frames.append(np.asarray(pil_img))
+                Image.fromarray(pred_arr).save(save_path)
+                viz_frames.append(pred_arr)
 
             if cfg.get("save_video", True):
                 video_path = os.path.join(scene_output_dir, "viz.mp4")
@@ -491,6 +500,26 @@ def forward_rendering(args):
 
 
 # ─────────────────────── Step 3: evaluate ──────────────────────────
+
+
+def composite_on_white(rgb, alpha, bg_value=255):
+    """
+    Composite RGB image onto white background using alpha mask.
+
+    Args:
+        rgb: np array [H, W, 3] uint8
+        alpha: np array [H, W] or [H, W, 1], values in [0, 255]
+    Returns:
+        Compositied image [H, W, 3] uint8
+    """
+    if alpha.ndim == 3:
+        alpha = alpha[:, :, 0]
+    alpha = np.clip(alpha.astype(np.float32) / 255.0, 0, 1)
+    rgb_f = rgb.astype(np.float32) / 255.0
+    bg = np.full((*rgb.shape[:2], rgb.shape[2]), bg_value / 255.0, dtype=np.float32)
+    a = alpha[:, :, np.newaxis]
+    out = (rgb_f * a + bg * (1 - a)).clip(0, 1) * 255
+    return out.astype(np.uint8)
 
 
 def compute_psnr(img1, img2):
@@ -560,14 +589,23 @@ def evaluate(args):
             if not os.path.exists(pred_path):
                 continue
 
-            gt_img = np.asarray(Image.open(gt_path).convert("RGB"))
+            gt_pil = Image.open(gt_path)
             pred_img = np.asarray(Image.open(pred_path).convert("RGB"))
 
+            if gt_pil.mode == "RGBA":
+                gt_arr = np.asarray(gt_pil)
+                alpha = gt_arr[:, :, 3]
+                gt_img = composite_on_white(gt_arr[:, :, :3], alpha)
+                pred_img = composite_on_white(pred_img, alpha)
+            else:
+                gt_img = np.asarray(gt_pil.convert("RGB"))
+
             if gt_img.shape != pred_img.shape:
-                pred_pil = Image.fromarray(pred_img).resize(
-                    (gt_img.shape[1], gt_img.shape[0]), Image.BILINEAR
+                pred_img = np.asarray(
+                    Image.fromarray(pred_img).resize(
+                        (gt_img.shape[1], gt_img.shape[0]), Image.BILINEAR
+                    )
                 )
-                pred_img = np.asarray(pred_pil)
 
             scene_psnr.append(compute_psnr(pred_img, gt_img))
             scene_ssim.append(compute_ssim(pred_img, gt_img))
