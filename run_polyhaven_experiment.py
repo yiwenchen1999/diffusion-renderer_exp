@@ -35,6 +35,9 @@ import sys
 import argparse
 import json
 import glob
+import subprocess
+import threading
+import time as time_module
 from contextlib import nullcontext
 from collections import defaultdict
 from pathlib import Path
@@ -59,6 +62,13 @@ def prepare(args):
         d for d in os.listdir(data_dir)
         if os.path.isdir(os.path.join(data_dir, d))
     ])
+
+    max_frames = getattr(args, "max_frames", None)
+    if max_frames is not None:
+        # ~4 frames per scene; need ceil(max_frames/4) scenes
+        max_scenes = max(1, (max_frames + 3) // 4)
+        scene_dirs = scene_dirs[:max_scenes]
+        print(f"Limiting to {max_scenes} scenes (~{max_scenes * 4} frames)")
 
     # Deduplicate: scenes with same object but different env share input_images.
     # We still create per-scene symlink folders so delighting output is per-scene.
@@ -671,6 +681,137 @@ def evaluate(args):
         print("No valid scenes found for evaluation.")
 
 
+# ─────────────────────── Benchmark ──────────────────────────
+
+
+def _gpu_monitor_loop(stop_event, results_dict, interval_ms=500):
+    """Background thread: sample GPU memory, record peak."""
+    peak_mb = 0.0
+    try:
+        while not stop_event.is_set():
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", "0"],
+                    capture_output=True, text=True, timeout=5)
+                if out.returncode == 0 and out.stdout.strip():
+                    val = float(out.stdout.strip().split()[0].replace(",", ""))
+                    peak_mb = max(peak_mb, val)
+            except (subprocess.TimeoutExpired, ValueError, FileNotFoundError, IndexError):
+                pass
+            stop_event.wait(interval_ms / 1000.0)
+    finally:
+        results_dict["peak_gpu_mb"] = peak_mb
+
+
+def _cpu_monitor_loop(stop_event, results_dict, interval_s=0.5):
+    """Background thread: sample process RSS, record peak."""
+    peak_mb = 0.0
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        while not stop_event.is_set():
+            try:
+                rss = proc.memory_info().rss / (1024 * 1024)
+                peak_mb = max(peak_mb, rss)
+            except Exception:
+                pass
+            stop_event.wait(interval_s)
+    except ImportError:
+        pass
+    finally:
+        results_dict["peak_cpu_rss_mb"] = peak_mb
+
+
+def run_benchmark(args):
+    """Run prepare + inverse + forward with timing and peak resource usage."""
+    data_dir = args.data_dir
+    workspace = args.workspace
+    n_frames = args.n_frames
+    rgbx_config = getattr(args, "rgbx_config", "configs/rgbx_inference.yaml")
+    xrgb_config = getattr(args, "xrgb_config", "configs/xrgb_inference.yaml")
+
+    # Prepare with frame limit
+    prepare_args = argparse.Namespace(
+        data_dir=data_dir, workspace=workspace, max_frames=n_frames
+    )
+    prepare(prepare_args)
+
+    inverse_input = os.path.join(workspace, "inverse_input")
+    delighting_dir = os.path.join(workspace, "delighting")
+    os.makedirs(delighting_dir, exist_ok=True)
+
+    gpu_results = {}
+    cpu_results = {}
+    stop_gpu = threading.Event()
+    stop_cpu = threading.Event()
+    gpu_thread = threading.Thread(target=_gpu_monitor_loop, args=(stop_gpu, gpu_results))
+    cpu_thread = threading.Thread(target=_cpu_monitor_loop, args=(stop_cpu, cpu_results))
+    gpu_thread.daemon = True
+    cpu_thread.daemon = True
+    gpu_thread.start()
+    cpu_thread.start()
+
+    t_start_total = time_module.perf_counter()
+
+    # Inverse rendering
+    inv_cmd = [
+        sys.executable, "inference_svd_rgbx.py", "--config", rgbx_config,
+        f"inference_input_dir={inverse_input}",
+        f"inference_save_dir={delighting_dir}",
+        "chunk_mode=all",
+        "overlap_n_frames=0",
+        "model_passes=['basecolor','normal','depth','roughness','metallic']",
+    ]
+    t_inv_start = time_module.perf_counter()
+    subprocess.run(inv_cmd, check=True, cwd=os.path.dirname(os.path.abspath(__file__)))
+    t_inv_end = time_module.perf_counter()
+    inv_time = t_inv_end - t_inv_start
+
+    # Forward rendering
+    fwd_args = argparse.Namespace(
+        data_dir=data_dir,
+        workspace=workspace,
+        config=xrgb_config,
+        extra=getattr(args, "extra", []) or [],
+    )
+    t_fwd_start = time_module.perf_counter()
+    forward_rendering(fwd_args)
+    t_fwd_end = time_module.perf_counter()
+    fwd_time = t_fwd_end - t_fwd_start
+
+    t_end_total = time_module.perf_counter()
+    total_time = t_end_total - t_start_total
+
+    stop_gpu.set()
+    stop_cpu.set()
+    gpu_thread.join(timeout=2.0)
+    cpu_thread.join(timeout=2.0)
+
+    report = {
+        "n_frames_target": n_frames,
+        "end_to_end_sec": round(total_time, 2),
+        "inverse_rendering_sec": round(inv_time, 2),
+        "forward_rendering_sec": round(fwd_time, 2),
+        "peak_gpu_mb": round(gpu_results.get("peak_gpu_mb", 0), 2),
+        "peak_cpu_rss_mb": round(cpu_results.get("peak_cpu_rss_mb", 0), 2),
+    }
+
+    report_path = os.path.join(workspace, "benchmark_report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print("\n" + "=" * 60)
+    print("BENCHMARK REPORT")
+    print("=" * 60)
+    print(f"  (1) End-to-end inference time:     {report['end_to_end_sec']:.2f} s")
+    print(f"  (2) Inverse rendering time:        {report['inverse_rendering_sec']:.2f} s")
+    print(f"  (2) Forward rendering time:        {report['forward_rendering_sec']:.2f} s")
+    print(f"  (3) Peak GPU memory:               {report['peak_gpu_mb']:.2f} MB")
+    print(f"  (3) Peak CPU (RSS):                {report['peak_cpu_rss_mb']:.2f} MB")
+    print("=" * 60)
+    print(f"Results saved to {report_path}")
+
+
 # ─────────────────────── CLI ──────────────────────────
 
 
@@ -685,6 +826,10 @@ def main():
     p_prep.add_argument("--data_dir", required=True, help="Path to source_data_polyhaven")
     p_prep.add_argument(
         "--workspace", default="polyhaven_workspace", help="Workspace directory"
+    )
+    p_prep.add_argument(
+        "--max_frames", type=int, default=None,
+        help="Limit to enough scenes for this many frames (~4 per scene)"
     )
 
     # forward
@@ -709,6 +854,16 @@ def main():
         "--workspace", default="polyhaven_workspace", help="Workspace directory"
     )
 
+    # benchmark
+    p_bench = subparsers.add_parser("benchmark", help="Benchmark pipeline (timing + peak GPU/CPU)")
+    p_bench.add_argument("--data_dir", required=True)
+    p_bench.add_argument("--workspace", default="polyhaven_workspace")
+    p_bench.add_argument("--n_frames", type=int, default=4,
+                         help="Stop after this many frames (~1 scene = 4 frames)")
+    p_bench.add_argument("--rgbx_config", default="configs/rgbx_inference.yaml")
+    p_bench.add_argument("--xrgb_config", default="configs/xrgb_inference.yaml")
+    p_bench.add_argument("extra", nargs="*", help="Extra omegaconf overrides for forward")
+
     args = parser.parse_args()
 
     if args.step == "prepare":
@@ -717,6 +872,8 @@ def main():
         forward_rendering(args)
     elif args.step == "evaluate":
         evaluate(args)
+    elif args.step == "benchmark":
+        run_benchmark(args)
 
 
 if __name__ == "__main__":

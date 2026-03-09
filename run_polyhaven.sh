@@ -1,9 +1,36 @@
 #!/bin/bash
 # Full pipeline to run DiffusionRenderer on source_data_polyhaven
+# Optional: BENCHMARK=1 or --benchmark to run benchmark (100 frames, timing + peak GPU/CPU)
 set -e
 
 DATA_DIR="source_data_polyhaven"
 WORKSPACE="polyhaven_workspace"
+# Benchmark: 1 scene (~4 frames) for quick timing/resource check
+N_FRAMES=4
+
+# Check for benchmark mode
+BENCHMARK=0
+for arg in "$@"; do
+    if [ "$arg" = "--benchmark" ]; then
+        BENCHMARK=1
+        break
+    fi
+done
+if [ "$BENCHMARK" = "1" ] || [ -n "$BENCHMARK_MODE" ]; then
+    BENCHMARK=1
+fi
+
+if [ "$BENCHMARK" = "1" ]; then
+    echo "=== BENCHMARK MODE: ${N_FRAMES} frames ==="
+    python run_polyhaven_experiment.py benchmark \
+        --data_dir "$DATA_DIR" \
+        --workspace "$WORKSPACE" \
+        --n_frames $N_FRAMES \
+        lora_scale=0.0
+    echo ""
+    echo "=== Done! Report in ${WORKSPACE}/benchmark_report.json ==="
+    exit 0
+fi
 
 echo "=== Step 0: Prepare input structure ==="
 python run_polyhaven_experiment.py prepare \
