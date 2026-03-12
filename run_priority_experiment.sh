@@ -4,7 +4,7 @@
 set -e
 
 SOURCE_DATA="../LVSMExp/source_data_polyhaven"
-PRIORITY_LIST="relight_metadata_smallsplit"
+PRIORITY_LIST="priority_list_figure"
 SUBSET_DATA="source_data_polyhaven_figure"
 WORKSPACE="polyhaven_workspace_figure"
 
