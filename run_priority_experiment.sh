@@ -4,9 +4,9 @@
 set -e
 
 SOURCE_DATA="../LVSMExp/source_data_polyhaven"
-PRIORITY_LIST="priority_list"
-SUBSET_DATA="source_data_polyhaven_priority"
-WORKSPACE="polyhaven_workspace_priority"
+PRIORITY_LIST="relight_metadata_smallsplit"
+SUBSET_DATA="source_data_polyhaven_smallsplit"
+WORKSPACE="polyhaven_workspace_smallsplit"
 
 echo "=== Step 0: Create priority sub-dataset ==="
 python create_priority_subset.py \
