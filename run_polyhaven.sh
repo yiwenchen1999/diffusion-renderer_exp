@@ -3,8 +3,8 @@
 # Optional: BENCHMARK=1 or --benchmark to run benchmark (100 frames, timing + peak GPU/CPU)
 set -e
 
-DATA_DIR="source_data_polyhaven"
-WORKSPACE="polyhaven_workspace"
+DATA_DIR="relight_metadata_smallsplit"
+WORKSPACE="polyhaven_workspace_figure"
 # Benchmark: 1 scene (~4 frames) for quick timing/resource check
 N_FRAMES=4
 
